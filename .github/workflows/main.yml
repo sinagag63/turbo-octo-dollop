@@ -1,0 +1,73 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      RUN_PASSWORD: ${{ secrets.RUN_PASSWORD }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+
+    steps:
+      - name: build
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xfce4-session xfce4-settings xfconf xrdp xorgxrdp xorg dbus dbus-x11 dbus-user-session
+          if [ -z "$RUN_PASSWORD" ]; then echo "::error::RUN_PASSWORD not set"; exit 1; fi
+          sudo useradd -m -s /bin/bash run
+          echo "run:$RUN_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo run
+          sudo tee /home/run/.xsession > /dev/null <<'XSESSION'
+          export XDG_CONFIG_DIRS=/etc:/etc/xdg
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          export DESKTOP_SESSION=xfce
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec /usr/bin/startxfce4
+          XSESSION
+          sudo chown run:run /home/run/.xsession
+          sudo chmod +x /home/run/.xsession
+          sudo tee /etc/xrdp/startwm.sh > /dev/null <<'STARTWM'
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_CONFIG_DIRS=/etc:/etc/xdg
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          export DESKTOP_SESSION=xfce
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_CONFIG_DIRS=/etc:/etc/xdg
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          export DESKTOP_SESSION=xfce
+          exec "$HOME/.xsession"
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+          sudo adduser xrdp ssl-cert
+          sudo systemctl enable --now xrdp
+          sudo ufw allow from 100.64.0.0/10 to any port 3389 proto tcp
+          sudo ufw --force enable
+          TOKEN_RESP=$(curl -s -X POST "https://api.tailscale.com/api/v2/oauth/token" \
+            -d "client_id=$TS_OAUTH_CLIENT_ID&client_secret=$TS_OAUTH_CLIENT_SECRET")
+          ACCESS_TOKEN=$(echo "$TOKEN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          echo "::add-mask::$ACCESS_TOKEN"
+          KEY_RESP=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":3600}')
+          TS_KEY=$(echo "$KEY_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+          echo "::add-mask::$TS_KEY"
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TS_KEY" --hostname=gh-runner-$GITHUB_RUN_ID
+          TS_IP=$(tailscale ip -4)
+          if [ -z "$TS_IP" ]; then echo "::error::Tailscale IP not assigned"; exit 1; fi
+          if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$TS_IP/3389" 2>/dev/null; then echo "TCP OK"; else echo "::error::Port 3389 not reachable"; exit 1; fi
+          echo "=== READY ==="
+          while true; do echo "[$(date)] Active"; sleep 300; done
